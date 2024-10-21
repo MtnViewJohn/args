@@ -52,6 +52,7 @@
 #include <cstddef>
 #include <cctype>
 #include <iostream>
+#include <fstream>
 
 #if defined(_MSC_VER) && _MSC_VER <= 1800
 #define noexcept
@@ -583,6 +584,14 @@ namespace args
         /** Flag is excluded from options help and usage line
          */
         Hidden = HiddenFromUsage | HiddenFromDescription | HiddenFromCompletion,
+        
+        /** Flag can only be present on the CLI
+         */
+        CLIOnly = 0x80,
+        
+        /** Flag can only be present in an rc file.
+         */
+        RCOnly = 0x100,
     };
 
     inline Options operator | (Options lhs, Options rhs)
@@ -2274,6 +2283,7 @@ namespace args
         private:
             std::string longprefix;
             std::string shortprefix;
+            std::string commentprefix;
 
             std::string longseparator;
 
@@ -2286,6 +2296,14 @@ namespace args
 
             CompletionFlag *completion = nullptr;
             bool readCompletion = false;
+        
+            enum class ContextType
+            {
+                CLI,
+                RCFile,
+            };
+
+            ContextType parseContext = ContextType::CLI;
 
         protected:
             enum class OptionType
@@ -2297,6 +2315,11 @@ namespace args
 
             OptionType ParseOption(const std::string &s, bool allowEmpty = false)
             {
+                if (parseContext == ContextType::RCFile)
+                {
+                    return OptionType::LongFlag;
+                }
+                
                 if (s.find(longprefix) == 0 && (allowEmpty || s.length() > longprefix.length()))
                 {
                     return OptionType::LongFlag;
@@ -2349,7 +2372,22 @@ namespace args
             {
                 values.clear();
 
+                Options opts = flag.GetOptions();
+                if ((opts & Options::CLIOnly) == Options::CLIOnly && parseContext == ContextType::RCFile)
+                {
+                    return "Flag '" + arg + "' was used in an RC file, which is not allowed";
+                }
+                if ((opts & Options::RCOnly) == Options::RCOnly && parseContext == ContextType::CLI)
+                {
+                    return "Flag '" + arg + "' was used in CLI context, which is not allowed";
+                }
+
                 Nargs nargs = flag.NumberOfArguments();
+                
+                if (parseContext == ContextType::RCFile && nargs.max > 1)
+                {
+                    return "Flag '" + arg + "' was used in an RC file, but multi-valued flags are disallowed in RC files";
+                }
 
                 if (hasJoined && !allowJoined && nargs.min != 0)
                 {
@@ -2418,7 +2456,9 @@ namespace args
             bool ParseLong(It &it, It end)
             {
                 const auto &chunk = *it;
-                const auto argchunk = chunk.substr(longprefix.size());
+                const auto argchunk = (parseContext == ContextType::CLI ?
+                    chunk.substr(longprefix.size())
+                    : chunk);
                 // Try to separate it, in case of a separator:
                 const auto separator = longseparator.empty() ? argchunk.npos : argchunk.find(longseparator);
                 // If the separator is in the argument, separate it.
@@ -2833,6 +2873,7 @@ namespace args
                 Epilog(epilog_);
                 LongPrefix("--");
                 ShortPrefix("-");
+                CommentPrefix("#");
                 LongSeparator("=");
                 Terminator("--");
                 SetArgumentSeparations(true, true, true, true);
@@ -2876,6 +2917,17 @@ namespace args
             {
                 this->shortprefix = shortprefix_;
                 this->helpParams.shortPrefix = shortprefix_;
+            }
+
+            /** The prefix for comments in rc files
+             */
+            const std::string &CommentPrefix() const
+            { return commentprefix; }
+            /** The prefix for comments in rc files
+             */
+            void CommentPrefix(const std::string &commentprefix_)
+            {
+                this->commentprefix = commentprefix_;
             }
 
             /** The separator for long flags
@@ -3069,6 +3121,7 @@ namespace args
                 Command::Reset();
                 matched = true;
                 readCompletion = false;
+                parseContext = ContextType::CLI;
             }
 
             /** Parse all arguments.
@@ -3103,20 +3156,59 @@ namespace args
                 return ParseArgs(std::begin(args), std::end(args));
             }
 
-            /** Convenience function to parse the CLI from argc and argv
+            /** Convenience function to parse the CLI from argc and argv and optionally parse
+             *  long options from an RC file.
              *
-             * Just assigns the program name and vectorizes arguments for passing into ParseArgs()
+             * Just assigns the program name and vectorizes the RC file and the arguments for passing into Parse()
              *
              * \return whether or not all arguments were parsed.  This works for detecting kick-out, but is generally useless as it can't do anything with it.
              */
-            bool ParseCLI(const int argc, const char * const * argv)
+            bool ParseCLI(const int argc, const char * const * argv, const std::string& rcfile = "")
             {
                 if (Prog().empty())
                 {
                     Prog(argv[0]);
                 }
-                const std::vector<std::string> args(argv + 1, argv + argc);
-                return ParseArgs(args) == std::end(args);
+                Reset();
+#ifdef ARGS_NOEXCEPT
+                error = GetError();
+                if (error != Error::None)
+                {
+                    return true;
+                }
+#endif
+                std::vector<std::string> args;
+                
+                if (!rcfile.empty())
+                {
+                    std::ifstream is(rcfile);
+                    if (is)
+                    {
+                        std::string line;
+                        while (std::getline(is, line))
+                        {
+                            // trim whitespace
+                            line.erase(0, line.find_first_not_of(" \t\n\r\f\v"));
+                            line.erase(line.find_last_not_of(" \t\n\r\f\v") + 1);
+                            // trim empty lines and comments
+                            if (!line.empty() && line.find(CommentPrefix()) != 0)
+                            {
+                                args.emplace_back(std::move(line));
+                            }
+                        }
+                        parseContext = ContextType::RCFile;
+                        if (Parse(args.begin(), args.end()) != std::end(args))
+                        {
+                            parseContext = ContextType::CLI;
+                            return false;
+                        }
+                        args.clear();
+                        parseContext = ContextType::CLI;
+                    }
+                }
+                
+                args.insert(args.end(), argv + 1, argv + argc);
+                return Parse(args.begin(), args.end()) == std::end(args);
             }
             
             template <typename T>
